@@ -1,0 +1,467 @@
+<?php
+
+/**
+ * @file
+ * Provides Turkish Banks Est payment method for Drupal Commerce
+ */
+
+
+/**
+ * Implements hook_menu().
+ */
+function garanti_xmlpay_menu() {
+	$items['admin/commerce/config/payment/garanti'] = array(
+	  'title' => 'Est gateway',
+	  'description' => 'Est payment gateway settings.',
+	  'page callback' => 'garanti_xmlpay_settings',
+	  'access arguments' => array('administer site configuration'),
+	  'type' => MENU_LOCAL_TASK
+	);
+	
+	return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function garanti_xmlpay_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['garanti_xmlpay'] = array(
+    'title' => t('Credit Card'),
+    'description' => t('Credit card payement method for Turkish Banks Est gateway.'),
+    'active' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Payment method callback: checkout form.
+ */
+function garanti_xmlpay_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+
+  // Prepare the fields to include on the credit card form.
+  $fields = array(
+    'code' => '',
+  );
+  
+//   $fields['logos'] = "<div id='credit_logos'><ul><li class='garanti'></li><li class='visa'></li><li class='mastercard'></li><li class='amex'></li></ul></div>";
+
+  // // Add the credit card types array if necessary.
+  // $card_types = array_diff(array_values($payment_method['settings']['card_types']), array(0));
+  // 
+  // if (!empty($card_types)) {
+  //   $fields['type'] = $card_types;
+  // }
+
+  return commerce_payment_credit_card_form($fields);
+}
+
+
+/**
+ * Payment method callback: checkout form validation.
+ */
+function garanti_xmlpay_submit_form_validate($payment_method, $pane_form, $pane_values, $order, $form_parents = array()) {
+  module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+
+  // Validate the credit card fields.
+  $settings = array(
+    'form_parents' => array_merge($form_parents, array('credit_card')),
+  );
+
+  if (!commerce_payment_credit_card_validate($pane_values['credit_card'], $settings)) {
+    return FALSE;
+  }
+}
+
+/**
+ * Payment method callback: checkout form submission.
+ */
+function garanti_xmlpay_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+
+  // Determine the credit card type if possible for use in later code.
+  if (!empty($pane_values['credit_card']['number'])) {
+    module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+    $card_type = commerce_payment_validate_credit_card_type($pane_values['credit_card']['number'], array_keys(commerce_payment_credit_card_types()));
+  }
+
+  // If the charge amount is 0...
+  if ($charge['amount'] == 0) {
+    // Prevent the transaction except under limited circumstances.
+    $prevent_transaction = TRUE;
+
+    // If the transaction should still be prevented...
+    if ($prevent_transaction) {
+      // Create a transaction to log the skipped transaction and display a
+      // helpful message to the customer.
+      $transaction = commerce_payment_transaction_new('garanti_xmlpay', $order->order_id);
+      $transaction->amount = $charge['amount'];
+      $transaction->currency_code = $charge['currency_code'];
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $transaction->message = t('Invalid @amount transaction not attempted.', array('@amount' => commerce_currency_format($charge['amount'], $charge['currency_code'])));
+      commerce_payment_transaction_save($transaction);
+
+      drupal_set_message('We encountered an error processing your transaction. Please contact us to resolve the issue.', 'error');
+      return FALSE;
+    }
+  }
+
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+
+
+
+  // Build a name-value pair array for this transaction.
+  $nvp = array(
+    'x_method' => 'CC',
+    'x_amount' => commerce_currency_amount_to_decimal($charge['amount'], $charge['currency_code']),
+    // 'x_amount' => $charge['amount'],
+    'x_currency' => $charge['currency_code'],
+    'x_card_num' => $pane_values['credit_card']['number'],
+    'x_exp_date' => $pane_values['credit_card']['exp_month'] . $pane_values['credit_card']['exp_year'],
+    'x_exp_month' => $pane_values['credit_card']['exp_month'],
+    'x_exp_year' => $pane_values['credit_card']['exp_year'],
+  );
+
+  if (isset($pane_values['credit_card']['code'])) {
+    $nvp['x_card_code'] = $pane_values['credit_card']['code'];
+  }
+
+  // Build a description for the order.
+  $description = array();
+
+  foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if (in_array($line_item_wrapper->type->value(), commerce_product_line_item_types())) {
+      $description[] = round($line_item_wrapper->quantity->value(), 2) . 'x ' . $line_item_wrapper->line_item_label->value();
+    }
+  }
+
+  // Add additional transaction invormation to the request array.
+  $nvp += array(
+    // Order Information
+    'x_invoice_num' => "73827222".$order->order_number,
+    'x_description' => substr(implode(', ', $description), 0, 255),
+
+    // Customer Information
+    'x_email' => substr($order->mail, 0, 255),
+    'x_cust_id' => substr($order->uid, 0, 20),
+    'x_customer_ip' => substr(ip_address(), 0, 15),
+  );
+
+  // Prepare the billing address for use in the request.
+  if ($order_wrapper->commerce_customer_billing->value()){
+    $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+
+    if (empty($billing_address['first_name'])) {
+      $name_parts = explode(' ', $billing_address['name_line']);
+      $billing_address['first_name'] = array_shift($name_parts);
+      $billing_address['last_name'] = implode(' ', $name_parts);
+    }
+
+    $nvp += array(
+      // Customer Billing Address
+      'x_first_name' => substr($billing_address['first_name'], 0, 50),
+      'x_last_name' => substr($billing_address['last_name'], 0, 50),
+      'x_company' => substr($billing_address['organisation_name'], 0, 50),
+      'x_address' => substr($billing_address['thoroughfare'], 0, 60),
+      'x_city' => substr($billing_address['locality'], 0, 40),
+      'x_state' => substr($billing_address['administrative_area'], 0, 40),
+      'x_zip' => substr($billing_address['postal_code'], 0, 20),
+      'x_country' => $billing_address['country'],
+    );
+  }
+  else {
+    $billing_address = array();
+  }
+
+  // Submit the request to Est.
+  $response = commerce_garanti_xmlpay_request($payment_method, $nvp);
+
+  // Prepare a transaction object to log the API response.
+  $transaction = commerce_payment_transaction_new('garanti_xmlpay', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->remote_id = $response[6];
+  $transaction->amount = $charge['amount'];
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->payload[REQUEST_TIME] = $response;
+  
+  // If we didn't get an approval response code...
+  if ($response["response"]=="Error") {
+    // Create a failed transaction with the error message.
+    $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+  }
+  elseif ($response["response"]=="Approved"){
+    $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+  }
+  
+  // Store the type of transaction in the remote status.
+  $transaction->remote_status = $response["transid"];
+  
+  
+  $transaction->message = $response["transid"] . " " . $response["response"];
+  
+  // Save the transaction information.
+  commerce_payment_transaction_save($transaction);
+  
+  // If the payment failed, display an error and rebuild the form.
+  if ($response["response"]=="Error") {
+    drupal_set_message(t('We received the following error processing your card. Please enter you information again or try a different card.'), 'error');
+    drupal_set_message(check_plain($response["error_msg"]) , 'error');
+    return FALSE;
+  }
+}
+
+
+/**
+ * Submits an API request to Est
+ *
+ * @param $payment_method
+ *   The payment method instance array associated with this API request.
+ */
+function commerce_garanti_xmlpay_request($payment_method, $nvp = array()) {
+  module_load_include('inc', 'garanti_xmlpay', 'est');
+//   $slug = variable_get("garanti_xmlpay_slug");
+//   $company = variable_get("garanti_xmlpay_company");
+//   $name = variable_get("garanti_xmlpay_name");
+//   $password = variable_get("garanti_xmlpay_password");
+//   $debug = variable_get("garanti_xmlpay_debug");
+//   $debug = ($debug=="false") ? false : true;
+
+//   $est = new EST($slug, $company, $name, $password, $debug);
+
+  $extra = array(
+  					"email" => $nvp['x_email'],
+  					"ipaddress" => $nvp['x_customer_ip'],
+  					"userid" => $nvp['x_cust_id'],
+					"billing_address_name" => $nvp['x_first_name']." ".$nvp['x_last_name'],
+					"billing_address_street1" => $nvp['x_address'],
+					"billing_address_city" => $nvp['x_city'],
+					"billing_address_company" => $nvp['x_company'],
+					"billing_address_postalcode" => $nvp['x_zip'],
+					"billing_address_state" => $nvp['x_state'],
+  					);
+
+  switch ($nvp['x_currency']) {
+  	case 'TRY':
+  		$currency_code = 949;
+  		break;
+  	case 'USD':
+  		$currency_code = 840;
+  		break;
+  	case 'EUR':
+  		$currency_code = 978;
+  		break;
+  }
+  
+  $exp_year_yy = substr($nvp['x_exp_year'],-2);
+  
+        $strMode = "PROD";
+        $strVersion = "v0.01";
+        $strTerminalID = "100xxxxx";
+        $strTerminalID_ = "0100xxxxx"; //TerminalID ba˛˝na 0 eklenerek 9 digite tamamlanmal˝d˝r.
+        $strProvUserID = "PROVAUT";
+        $strProvisionPassword = "xxx"; //ProvUserID ˛ifresi
+        $strUserID = "xxx";
+        $strMerchantID = "xxx"; //‹ye ›˛yeri Numaras˝
+        $strIPAddress = $nvp['x_customer_ip'];  //M¸˛teri IP si 
+        $strEmailAddress = "test@test.com";
+        $strOrderID = $nvp['x_invoice_num'];
+        $strInstallmentCnt = ""; //Taksit Say˝s˝. Bo˛ gˆnderilirse taksit yap˝lmaz
+        $strNumber = $nvp['x_card_num'];
+        $strExpireDate = $nvp['x_exp_month'].$exp_year_yy;
+        $strCVV2 = $nvp['x_card_code'];
+        $strAmount = $nvp['x_amount']*100; //›˛lem Tutar˝ 1.00 TL iÁin 100 gˆnderilmelidir. 
+        $strType = "sales";
+        $strCurrencyCode = $currency_code;
+        $strCardholderPresentCode = "0";
+        $strMotoInd = "N";
+        $strHostAddress = "https://sanalposprov.garanti.com.tr/VPServlet";
+        $SecurityData = strtoupper(sha1($strProvisionPassword.$strTerminalID_));
+        $HashData = strtoupper(sha1($strOrderID.$strTerminalID.$strNumber.$strAmount.$SecurityData));
+  $xml= "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>
+  <GVPSRequest> 
+    <Mode>$strMode</Mode>
+    <Version>$strVersion</Version>
+    <Terminal>
+      <ProvUserID>$strProvUserID</ProvUserID>
+      <HashData>$HashData</HashData>
+      <UserID>$strUserID</UserID>
+      <ID>$strTerminalID</ID>
+      <MerchantID>$strMerchantID</MerchantID>
+    </Terminal>
+    <Customer>
+      <IPAddress>$strIPAddress</IPAddress>
+      <EmailAddress>$strEmailAddress</EmailAddress>
+    </Customer> 
+    <Card>
+      <Number>$strNumber</Number>
+      <ExpireDate>$strExpireDate</ExpireDate>
+      <CVV2>$strCVV2</CVV2>
+    </Card> 
+    <Order>
+      <OrderID>$strOrderID</OrderID>
+      <GroupID></GroupID>
+      <Description></Description>
+    </Order>
+    <Transaction>
+      <Type>$strType</Type>
+      <InstallmentCnt>$strInstallmentCnt</InstallmentCnt>
+      <Amount>$strAmount</Amount>
+      <CurrencyCode >$strCurrencyCode</CurrencyCode>
+      <CardholderPresentCode>$strCardholderPresentCode</CardholderPresentCode>
+      <MotoInd>$strMotoInd</MotoInd>
+      <Description></Description>
+      <OriginalRetrefNum></OriginalRetrefNum>
+    </Transaction>
+  </GVPSRequest>";
+  
+    $ch=curl_init();
+    curl_setopt($ch, CURLOPT_URL, $strHostAddress);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1); 
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, "data=".$xml); 
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0); 
+    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0); 
+    $results = curl_exec($ch);
+    curl_close($ch);
+//     echo " b Giden İstek /b br / "; 
+//     echo $xml;
+//     echo " br / b Gelen Yanıt /b br / "; 
+//     echo $results;
+//     var_dump($results);exit;
+
+//     $responseDomObject = simplexml_load_string($results);
+    $responseDomObject = new DOMDocument();
+    $responseDomObject->loadXML($results);
+    $trans_id = XMLBuilder::get_data($responseDomObject, "RetrefNum");
+    $message = XMLBuilder::get_data($responseDomObject, "Message");
+    $error_message = XMLBuilder::get_data($responseDomObject, "ErrorMessage");
+    
+//     $responseDomObject = new DOMDocument();
+//     $responseDomObject->loadXML($this->raw_response);
+  //send the payment request
+//   $response = $est->pay($nvp['x_card_num'], $nvp['x_card_code'], $nvp['x_exp_month'], $nvp['x_exp_year'], $nvp['x_amount'], $currency_code, '', $nvp['x_invoice_num'], "Auth", $extra);
+
+  // Log the response if specified.
+  if ($message == 'Approved') {
+    $response = array("response"=>"Approved","transid"=>$trans_id);
+    watchdog('garanti_xmlpay', 'Est response: !param', array('!param' => "Basarili id:".$trans_id, WATCHDOG_DEBUG));
+  }
+  else 
+  {
+    $response = array("response"=>"Error","error_msg"=>$error_message);
+    watchdog('garanti_xmlpay', 'Est response: !param', array('!param' => "Hata mesaj:".$error_message, WATCHDOG_DEBUG));
+  }
+    
+  return $response;
+}
+
+/**
+ * Creates an example payment transaction for the specified charge amount.
+ *
+ * @param $payment_method
+ *   The payment method instance object used to charge this payment.
+ * @param $order
+ *   The order object the payment applies to.
+ * @param $charge
+ *   An array indicating the amount and currency code to charge.
+ * @param $name
+ *   The name entered on the submission form.
+ */
+function garanti_xmlpay_transaction($payment_method, $order, $charge, $name) {
+  $transaction = commerce_payment_transaction_new('garanti_xmlpay', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->amount = $charge['amount'];
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+  $transaction->message = 'Name: @name';
+  $transaction->message_variables = array('@name' => $name);
+
+  commerce_payment_transaction_save($transaction);
+}
+
+/**
+ * Form builder function for module settings.
+ */
+function garanti_xmlpay_settings() {
+	return drupal_get_form('garanti_xmlpay_settings_form');
+}
+
+function garanti_xmlpay_settings_form()
+{
+	$form['garanti_xmlpay_slug'] = array(
+		'#type' => 'select',
+	'#title' => t('Select the bank you work with'),
+	'#options' => array('akbank'=>t("Akbank"),'anadolubank'=>t("Anadolubank"),'garanti'=>t("Garanti bankasƒ±"),'finansbank'=>t("Finansbank"),'halnkbank'=>t("Halkbankasƒ±"),'isbank'=>t("ƒ∞≈ü bankasƒ±")),
+	'#required' => TRUE,
+	'#default_value' => variable_get('garanti_xmlpay_slug', ""),
+	);
+	$form['garanti_xmlpay_company'] = array(
+		'#type' => 'textfield',
+	'#title' => t('Merchant id'),
+	'#default_value' => variable_get('garanti_xmlpay_company', ""),
+	'#description' => t('This is the your merchant id.'),
+	'#required' => TRUE,
+	);
+	$form['garanti_xmlpay_name'] = array(
+		'#type' => 'textfield',
+	'#title' => t('Name'),
+	'#default_value' => variable_get('garanti_xmlpay_name', ""),
+	'#required' => TRUE,
+	);
+	$form['garanti_xmlpay_password'] = array(
+		'#type' => 'password',
+	'#title' => t('Password'),
+	'#default_value' => variable_get('garanti_xmlpay_password', ""),
+	'#required' => TRUE,
+	);
+	$form['garanti_xmlpay_debug'] = array(
+		'#type' => 'select',
+	'#title' => t('Debug mode'),
+	'#options' => array('true'=>t("True"),'false'=>t("False")),
+	'#required' => TRUE,
+	'#default_value' => variable_get('garanti_xmlpay_debug', ""),
+	);
+	$form['submit'] = array('#type' => 'submit', '#value' => t('Submit'));
+
+	return $form;
+}
+
+function garanti_xmlpay_settings_form_submit($form_id, $form_values) {
+	foreach ($form_values["values"] as $key => $value) {
+		variable_set($key,$value);
+	}
+	drupal_set_message(t("Your changes have been saved"));
+}
+
+
+/**
+ * Returns the message text for a CVV match.
+ */
+function garanti_xmlpay_cvv_response($code) {
+  switch ($code) {
+    case 'M':
+      return t('Match');
+    case 'N':
+      return t('No Match');
+    case 'P':
+      return t('Not Processed');
+    case 'S':
+      return t('Should have been present');
+    case 'U':
+      return t('Issuer unable to process request');
+  }
+
+  return '-';
+}
+
+
+
+
+
+
+
+
+
